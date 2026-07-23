@@ -1,12 +1,45 @@
 import streamlit as st
 import pandas as pd
 import os
+import sqlite3
 from PIL import Image
 
 st.set_page_config(page_title="クラウド画像アプリ", layout="wide")
 
 IMAGE_DIR = "images"
+DB_PATH = "images.db"
 os.makedirs(IMAGE_DIR, exist_ok=True)
+
+# DB初期化と同期
+@st.cache_resource
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE,
+            filepath TEXT,
+            size_kb REAL
+        )
+    ''')
+    conn.commit()
+
+    # 既存ファイルの同期（起動時など）
+    valid_extensions = (".png", ".jpg", ".jpeg")
+    if os.path.exists(IMAGE_DIR):
+        for file in os.listdir(IMAGE_DIR):
+            if file.lower().endswith(valid_extensions):
+                path = os.path.join(IMAGE_DIR, file)
+                size_kb = round(os.path.getsize(path) / 1024, 1)
+                c.execute('''
+                    INSERT OR IGNORE INTO images (filename, filepath, size_kb)
+                    VALUES (?, ?, ?)
+                ''', (file, path, size_kb))
+        conn.commit()
+    conn.close()
+
+init_db()
 
 st.title("☁️ クラウド画像 検索・表示アプリ")
 
@@ -18,27 +51,42 @@ with st.sidebar:
         save_path = os.path.join(IMAGE_DIR, uploaded_file.name)
         with open(save_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
+
+        # データベースに登録
+        size_kb = round(os.path.getsize(save_path) / 1024, 1)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR IGNORE INTO images (filename, filepath, size_kb)
+            VALUES (?, ?, ?)
+        ''', (uploaded_file.name, save_path, size_kb))
+        conn.commit()
+        conn.close()
+
         st.success(f"{uploaded_file.name} を保存しました！")
 
-# --- 2. 保存されている画像のデータ化 ---
-def load_images():
-    valid_extensions = (".png", ".jpg", ".jpeg")
-    files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(valid_extensions)]
-    data = []
-    for i, file in enumerate(files):
-        path = os.path.join(IMAGE_DIR, file)
-        size_kb = round(os.path.getsize(path) / 1024, 1)
-        data.append({"ID": i + 1, "ファイル名": file, "ファイルパス": path, "サイズ(KB)": size_kb})
-    return pd.DataFrame(data)
-
-df_all = load_images()
-
-# --- 3. 検索バー ---
+# --- 2. 検索バー ---
 search_query = st.text_input("🔍 ファイル名で検索", "")
-if not df_all.empty and search_query:
-    df_filtered = df_all[df_all["ファイル名"].str.contains(search_query, case=False, na=False)]
-else:
-    df_filtered = df_all
+
+# --- 3. データベースからのデータ読み込み ---
+def load_images_from_db(query=""):
+    conn = sqlite3.connect(DB_PATH)
+    if query:
+        # 部分一致検索
+        df = pd.read_sql_query(
+            "SELECT id AS ID, filename AS ファイル名, filepath AS ファイルパス, size_kb AS 'サイズ(KB)' FROM images WHERE filename LIKE ?",
+            conn,
+            params=(f"%{query}%",)
+        )
+    else:
+        df = pd.read_sql_query(
+            "SELECT id AS ID, filename AS ファイル名, filepath AS ファイルパス, size_kb AS 'サイズ(KB)' FROM images",
+            conn
+        )
+    conn.close()
+    return df
+
+df_filtered = load_images_from_db(search_query)
 
 st.divider()
 
@@ -66,7 +114,11 @@ with col_right:
     if not df_filtered.empty and 'selected_rows' in locals() and len(selected_rows) > 0:
         selected_row_data = df_filtered.iloc[selected_rows[0]]
         st.markdown(f"**{selected_row_data['ファイル名']}**")
-        img = Image.open(selected_row_data["ファイルパス"])
-        st.image(img, use_container_width=True)
+
+        if os.path.exists(selected_row_data["ファイルパス"]):
+            img = Image.open(selected_row_data["ファイルパス"])
+            st.image(img, use_container_width=True)
+        else:
+            st.error("画像ファイルが見つかりません。")
     else:
         st.info("👈 左側のリストから画像を選択してください")
